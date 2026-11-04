@@ -1,0 +1,5 @@
+customer_id,first_name,last_name,email,phone,address,city,state,postal_code,country,customer_segment,source_system,batch_id,source_updated_at
+C1005,David,Wilson,david.wilson@example.com,,,,,,,,RETAIL_CSV,BATCH_20261103_001,11/03/2026 09:00:00
+C1006,Lisa,Anderson,lisa.anderson@example.com,,,,,,,,RETAIL_CSV,BATCH_20261103_001,11/03/2026 09:05:00
+C1007,Robert,Thomas,robert.thomas@example.com,,,,,,,,RETAIL_CSV,BATCH_20261103_001,11/03/2026 09:10:00
+C1008,Maria,Jackson,maria.jackson@example.com,,,,,,,,RETAIL_CSV,BATCH_20261103_001,11/03/2026 09:15:00
