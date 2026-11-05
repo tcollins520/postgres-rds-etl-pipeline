@@ -12,7 +12,7 @@ Data is being integrated from three source types:
 - Oracle Database
 - MongoDB
 
-CSV ingestion has been implemented using Apache NiFi. Oracle and MongoDB integrations are planned.
+CSV ingestion and the initial Oracle LYRIS CUSTOMERS integration have been implemented using Apache NiFi. MongoDB integration is planned.
 
 The pipeline loads source data into PostgreSQL staging tables, transforms and validates the data, and loads it into production tables.
 
@@ -24,10 +24,10 @@ The project demonstrates practical DBA and data engineering skills, including se
 |---|---|
 | Cloud Platform | Amazon Web Services (AWS) |
 | Target Database | Amazon RDS for PostgreSQL 18.6 |
-| Source Databases | Oracle Database, MongoDB |
+| Source Databases | Oracle Database 19c, MongoDB |
 | Source Files | CSV |
 | Infrastructure as Code | Terraform |
-| Data Integration | Apache NiFi 2.12 |
+| Data Integration | Apache NiFi 2.12.0 |
 | Workflow Orchestration | Apache Airflow (planned) |
 | Database Language | SQL, PL/pgSQL |
 | Operating System | Red Hat Enterprise Linux 8.10 |
@@ -70,9 +70,43 @@ The project follows a source-to-staging-to-production architecture.
              Customer Data
 ```
 
+**Implemented Oracle LYRIS CUSTOMERS workflow:**
+
+```text
+       Oracle Database 19c
+        LYRIS_APP.CUSTOMERS
+                  |
+                  v
+          Apache NiFi 2.12.0
+                  |
+          ExecuteSQL (JDBC)
+                  |
+          UpdateAttribute
+          Batch ID / Source
+                  |
+          UpdateRecord
+          Record Metadata
+                  |
+          PutDatabaseRecord
+                  |
+                  v
+       PostgreSQL RDS 18.6
+                  |
+                  v
+      staging.stg_lyris_customers
+                  |
+          ReplaceText
+          Build Production UPSERT
+                  |
+                  v
+              PutSQL
+                  |
+                  v
+      production.lyris_customers
+```
+
 **Planned architecture extensions:**
 
-- Oracle Database extraction through JDBC.
 - MongoDB document and collection extraction.
 - Apache Airflow orchestration and scheduling.
 - Additional production dimension and fact tables.
@@ -118,70 +152,36 @@ The DBA portion of this project covers:
 
 The database uses separate schemas to organize ingestion, production data, and ETL auditing.
 
-| Schema | Purpose |
-|---|---|
-| `staging` | Holds raw source data during ingestion |
-| `production` | Contains transformed business data |
-| `audit` | Stores ETL execution and batch information |
-
 ### Staging Layer
 
-The staging layer receives source data before transformation and production loading.
+The staging schema contains source-specific tables used to receive extracted data before production loading.
 
-**Implemented:**
+Implemented tables include:
 
-- `staging.stg_customers`
-- CSV customer ingestion
+- `staging.stg_customers` — CSV customer ingestion
+- `staging.stg_lyris_customers` — Oracle LYRIS customer ingestion
 - Source system identification
-- Batch identification
-- Raw source timestamp preservation
-- Staging data validation
+- Batch ID tracking
+- Load timestamps
 
-The staging table preserves the original source timestamp as text to avoid assuming a source timezone or changing the original timestamp representation.
+Oracle source data is maintained separately from the existing CSV customer pipeline.
 
 ### Production Data Model
 
-The initial production implementation includes:
+Implemented production tables include:
 
-- `production.customers`
+- `production.customers` — CSV customer records
+- `production.lyris_customers` — Oracle LYRIS customer records
 
-The customer table uses a composite primary key consisting of `source_system` and `customer_id`.
+The Oracle production table uses `customer_id` as its primary key and maintains source-system and batch metadata.
 
-The staging-to-production load uses PostgreSQL `INSERT ... ON CONFLICT DO UPDATE` to support inserts and updates.
+### Audit Schema
 
-**Planned dimensional model:**
+The audit schema contains:
 
-Dimension tables:
+- `audit.etl_batch_log`
 
-- `production.dim_customer` — Slowly Changing Dimension Type 2 (SCD2)
-- `production.dim_product` — Slowly Changing Dimension Type 1 (SCD1)
-- `production.dim_store` — Slowly Changing Dimension Type 1 (SCD1)
-- `production.dim_date`
-
-Fact table:
-
-- `production.fact_sales` — Sales transactions at the individual order-line grain
-
-### ETL Audit
-
-The `audit.etl_batch_log` table records ETL execution information and supports operational monitoring.
-
-Implemented audit fields include:
-
-- Execution ID
-- Batch ID
-- Workflow name
-- Source system
-- Start and end timestamps
-- Records read, inserted, updated, and rejected
-- Batch status
-- Error message
-
-The table supports `RUNNING`, `SUCCESS`, and `FAILED` statuses.
-
-The NiFi workflow has been tested with both successful and failed staging-load scenarios.
-
-**Current limitation:** The NiFi audit paths record execution status and error information, but detailed record-count metrics are not yet dynamically calculated. The current audit flow uses default or placeholder count values.
+This table supports ETL execution tracking and operational monitoring for the CSV ingestion workflow.
 
 ## ETL Pipeline
 
@@ -191,104 +191,48 @@ The ETL workflow is organized into three primary stages.
 
 Apache NiFi is used to extract data from source systems and load it into PostgreSQL staging tables.
 
-**Implemented: CSV customer ingestion**
+**Implemented CSV extraction:**
 
-The NiFi flow contains six processors:
-
-1. `GetFile` — Retrieves the incoming CSV file.
-2. `UpdateAttribute` — Adds source system, workflow, and batch metadata.
-3. `PutDatabaseRecord` — Parses CSV records using the CSVReader Controller Service and inserts them into PostgreSQL staging.
-4. `ReplaceText` — Prepares the successful execution audit SQL.
-5. `ReplaceText_Failure_Audit` — Prepares the failed execution audit SQL.
-6. `PutSQL` — Executes the audit SQL against PostgreSQL.
-
-The successful staging-load path writes a `SUCCESS` audit record.
-
-The failed staging-load path writes a `FAILED` audit record with an error description.
-
-The workflow has been tested for both paths, and the corresponding audit records were verified in PostgreSQL.
-
-**Additional implemented functionality:**
-
+- CSV file ingestion using NiFi
+- `GetFile` processor for file acquisition
+- CSVReader Controller Service for record parsing
+- `PutDatabaseRecord` processor for PostgreSQL insertion
 - PostgreSQL JDBC connectivity
-- CSVReader Controller Service
 - Batch identification and source metadata
-- Staging data insertion
-- Successful and failed execution auditing
+- Staging data validation
 
-**Planned:**
+**Implemented Oracle extraction:**
 
-- Oracle database extraction using JDBC
+- Oracle Database 19c JDBC connectivity
+- Dedicated read-only Oracle connection for LYRIS
+- `NIFI_LYRIS_RO` source account
+- `ExecuteSQL` extraction from `LYRIS_APP.CUSTOMERS`
+- `UpdateAttribute` for source and batch metadata
+- `UpdateRecord` for record enrichment
+- `PutDatabaseRecord` for PostgreSQL staging insertion
+- `ReplaceText` to construct the production UPSERT statement
+- `PutSQL` to execute the production load
+- Error routing through `LogAttribute`
+
+The initial Oracle pipeline successfully extracted and loaded three customer records into `staging.stg_lyris_customers` and `production.lyris_customers`.
+
+**Planned extraction capabilities:**
+
 - MongoDB collection extraction
 - Incremental extraction from database sources
-- Source-specific data type and schema handling
-- Secure connectivity to source databases
+- Additional source-specific data type and schema handling
 
 ### 2. Transform
 
-SQL transformations are used to process staging data and prepare it for production.
+The transformation phase processes staging data and prepares it for production.
 
 **Implemented:**
 
-- Staging-to-production customer data transformation
-- Customer record insertion
-- Duplicate handling through conflict detection
-- PostgreSQL upsert processing
-
-The customer upsert uses:
-
-```sql
-INSERT INTO production.customers (
-    customer_id,
-    first_name,
-    last_name,
-    email,
-    phone,
-    address,
-    city,
-    state,
-    postal_code,
-    country,
-    customer_segment,
-    source_system,
-    source_updated_at,
-    last_batch_id
-)
-SELECT
-    customer_id,
-    first_name,
-    last_name,
-    email,
-    phone,
-    address,
-    city,
-    state,
-    postal_code,
-    country,
-    customer_segment,
-    source_system,
-    source_updated_at,
-    batch_id
-FROM staging.stg_customers
-WHERE batch_id = 'BATCH_20261103_001'
-ON CONFLICT (source_system, customer_id)
-DO UPDATE SET
-    first_name = EXCLUDED.first_name,
-    last_name = EXCLUDED.last_name,
-    email = EXCLUDED.email,
-    phone = EXCLUDED.phone,
-    address = EXCLUDED.address,
-    city = EXCLUDED.city,
-    state = EXCLUDED.state,
-    postal_code = EXCLUDED.postal_code,
-    country = EXCLUDED.country,
-    customer_segment = EXCLUDED.customer_segment,
-    source_updated_at = EXCLUDED.source_updated_at,
-    last_batch_id = EXCLUDED.last_batch_id,
-    updated_at = CURRENT_TIMESTAMP;
-```
-
-The upsert was tested by inserting customer records and subsequently updating an existing customer's email address.
+- SQL-based production UPSERT for Oracle LYRIS CUSTOMERS
+- Conversion of staged `created_at` values into PostgreSQL timestamps
+- Conflict handling using `ON CONFLICT`
+- Updating existing customer records when the customer ID already exists
+- Batch ID and source-system tracking
 
 **Planned capabilities:**
 
@@ -304,12 +248,12 @@ The upsert was tested by inserting customer records and subsequently updating an
 
 ### 3. Load
 
-The production layer receives transformed data from the staging layer.
+The production layer receives data from the staging layer.
 
 **Implemented:**
 
-- Customer production table
-- Composite primary key
+- CSV customer production table
+- Oracle LYRIS customer production table
 - SQL-based inserts and updates
 - Conflict handling using `ON CONFLICT`
 - Batch ID tracking
@@ -327,7 +271,7 @@ The production layer receives transformed data from the staging layer.
 
 ## ETL Monitoring and Automation
 
-The audit schema provides execution tracking for the NiFi workflow.
+The audit schema provides execution tracking for the CSV ingestion workflow.
 
 **Implemented:**
 
@@ -372,32 +316,33 @@ The DBA engineering portion will cover:
 postgres-rds-etl-pipeline/
 │
 ├── README.md
-│
+├── .gitignore
 ├── customers_sample.csv
-│
-├── terraform/
-│
-├── sql/
-│   ├── staging/
-│   ├── production/
-│   │   └── 01_customers.sql
-│   └── audit/
-│       └── 01_etl_batch_log.sql
-│
-├── etl/
-│   ├── nifi/
-│   │   └── flows/
-│   │       └── csv_customers_ingestion_audit_flow.json
-│   └── airflow/
-│
-├── scripts/
-│   ├── administration/
-│   ├── backup_recovery/
-│   └── monitoring/
 │
 ├── docs/
 │
-└── .gitignore
+├── etl/
+│   ├── airflow/
+│   └── nifi/
+│       └── flows/
+│           ├── csv_customers_ingestion_audit_flow.json
+│           ├── csv_customers_ingestion.json
+│           └── oracle_lyris_customers_ingestion.json
+│
+├── scripts/
+│
+├── sql/
+│   ├── audit/
+│   │   └── 01_etl_batch_log.sql
+│   │
+│   ├── production/
+│   │   └── 01_customers.sql
+│   │
+│   └── staging/
+│       ├── 01_stg_customers.sql
+│       └── 02_validate_customer_ingestion.sql
+│
+└── terraform/
 ```
 
 ## Project Implementation Status
@@ -410,7 +355,7 @@ postgres-rds-etl-pipeline/
 | 4 | CSV extraction using Apache NiFi | Complete |
 | 5 | NiFi success and failure audit handling | Complete |
 | 6 | Customer staging-to-production upsert | Complete |
-| 7 | Oracle extraction | Planned |
+| 7 | Oracle LYRIS CUSTOMERS extraction and production load | Complete |
 | 8 | MongoDB extraction | Planned |
 | 9 | Data transformation and cleansing enhancements | Planned |
 | 10 | Production dimension and fact loading | Planned |
@@ -450,7 +395,7 @@ Documentation will include:
 - CSV extraction and ingestion
 - NiFi success and failure auditing
 - SQL transformation and production loading
-- Oracle extraction
+- Oracle extraction and NiFi configuration
 - MongoDB extraction
 - Airflow orchestration
 - Backup and recovery procedures
