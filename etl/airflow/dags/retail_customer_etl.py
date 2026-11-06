@@ -1,18 +1,469 @@
+import csv
+import json
+import shutil
+import ssl
+import time
+import uuid
+
 from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from airflow.sdk import DAG
+from airflow.hooks.base import BaseHook
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.utils.trigger_rule import TriggerRule
 
-BATCH_ID = "BATCH_20261103_001"
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
 SOURCE_SYSTEM = "RETAIL_CSV"
 WORKFLOW_NAME = "CSV_CUSTOMER_INGESTION"
+
 POSTGRES_CONN_ID = "postgres_operations"
+NIFI_CONN_ID = "nifi_api"
+
+NIFI_SOURCE_FILE = Path("/opt/nifi/data/incoming/customers.csv")
+ARCHIVE_DIR = Path("/home/ec2-user/airflow/archive")
+
+GETFILE_ID = "a46f2bd2-01a1-1000-d7e2-03e7631a193f"
+UPDATE_ATTRIBUTE_ID = "a83fff7e-01a1-1000-565a-f3f1eb2646f9"
+UPDATE_RECORD_ID = "b307cbf6-01a1-1000-c008-3287f79df89d"
+PUT_DATABASE_RECORD_ID = "a472746c-01a1-1000-cfb8-5f02a384af14"
+REPLACE_TEXT_ID = "a846c612-01a1-1000-cbc9-f1a0abf9de6f"
+FAILURE_AUDIT_ID = "a85c0e6b-01a1-1000-1497-b512b9aa40e8"
+PUT_SQL_ID = "a83e0c47-01a1-1000-7c7b-c2bcaa827563"
+
+RETAIL_PROCESSORS = [
+    GETFILE_ID,
+    UPDATE_ATTRIBUTE_ID,
+    UPDATE_RECORD_ID,
+    PUT_DATABASE_RECORD_ID,
+    REPLACE_TEXT_ID,
+    FAILURE_AUDIT_ID,
+    PUT_SQL_ID,
+]
+
+DOWNSTREAM_PROCESSORS = [
+    PUT_SQL_ID,
+    FAILURE_AUDIT_ID,
+    REPLACE_TEXT_ID,
+    PUT_DATABASE_RECORD_ID,
+    UPDATE_RECORD_ID,
+    UPDATE_ATTRIBUTE_ID,
+]
 
 
-def validate_staging():
-    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+# =========================================================
+# NIFI API
+# =========================================================
+
+def nifi_connection():
+    conn = BaseHook.get_connection(NIFI_CONN_ID)
+    extra = conn.extra_dejson
+
+    verify = extra.get("verify", True)
+
+    if isinstance(verify, str):
+        context = ssl.create_default_context(cafile=verify)
+    else:
+        context = ssl.create_default_context()
+
+    return f"{conn.host.rstrip('/')}:{conn.port}", conn.login, conn.password, context
+
+
+def nifi_token():
+    base_url, username, password, context = nifi_connection()
+
+    body = urlencode({
+        "username": username,
+        "password": password,
+    }).encode()
+
+    request = Request(
+        f"{base_url}/nifi-api/access/token",
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        method="POST",
+    )
+
+    with urlopen(request, context=context, timeout=30) as response:
+        token = response.read().decode().strip()
+
+    if not token:
+        raise RuntimeError("NiFi returned an empty access token")
+
+    return token
+
+
+def nifi_request(method, endpoint, token, payload=None):
+    base_url, _, _, context = nifi_connection()
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+    body = None
+
+    if payload is not None:
+        body = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+
+    request = Request(
+        f"{base_url}/nifi-api{endpoint}",
+        data=body,
+        headers=headers,
+        method=method,
+    )
+
+    with urlopen(request, context=context, timeout=30) as response:
+        result = response.read().decode()
+
+    return json.loads(result) if result else {}
+
+
+def set_processor_state(token, processor_id, state):
+    entity = nifi_request(
+        "GET",
+        f"/processors/{processor_id}",
+        token,
+    )
+
+    current_state = entity["component"].get("state")
+
+    if current_state == state:
+        return
+
+    payload = {
+        "revision": entity["revision"],
+        "state": state,
+    }
+
+    nifi_request(
+        "PUT",
+        f"/processors/{processor_id}/run-status",
+        token,
+        payload,
+    )
+
+    print(f"Processor {processor_id}: {state}")
+
+
+def stop_retail_processors(token):
+    for processor_id in RETAIL_PROCESSORS:
+        try:
+            set_processor_state(token, processor_id, "STOPPED")
+        except Exception as exc:
+            print(f"Unable to stop {processor_id}: {exc}")
+
+
+def update_nifi_batch_id(token, batch_id):
+    entity = nifi_request(
+        "GET",
+        f"/processors/{UPDATE_ATTRIBUTE_ID}",
+        token,
+    )
+
+    payload = {
+        "revision": entity["revision"],
+        "component": {
+            "id": UPDATE_ATTRIBUTE_ID,
+            "config": {
+                "properties": {
+                    "batch_id": batch_id,
+                }
+            },
+        },
+    }
+
+    nifi_request(
+        "PUT",
+        f"/processors/{UPDATE_ATTRIBUTE_ID}",
+        token,
+        payload,
+    )
+
+    print(f"NiFi batch ID updated: {batch_id}")
+
+
+# =========================================================
+# TASK 1: GENERATE BATCH ID
+# =========================================================
+
+def generate_batch_id():
+    batch_id = (
+        "BATCH_"
+        + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        + "_"
+        + uuid.uuid4().hex[:8].upper()
+    )
+
+    print(f"Generated batch ID: {batch_id}")
+    return batch_id
+
+
+# =========================================================
+# TASK 2: ARCHIVE SOURCE FILE
+# =========================================================
+
+def archive_source_file():
+    if not NIFI_SOURCE_FILE.is_file():
+        raise FileNotFoundError(
+            f"Source file not found: {NIFI_SOURCE_FILE}"
+        )
+
+    batch_id = None
+
+    # The batch ID is supplied by the calling task through XCom.
+    # This function is wrapped by archive_source_task below.
+    raise RuntimeError("Use archive_source_task")
+
+
+def archive_source_task(**context):
+    batch_id = context["ti"].xcom_pull(
+        task_ids="generate_batch_id"
+    )
+
+    if not NIFI_SOURCE_FILE.is_file():
+        raise FileNotFoundError(
+            f"Source file not found: {NIFI_SOURCE_FILE}"
+        )
+
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+    archive_file = ARCHIVE_DIR / f"customers_{batch_id}.csv"
+
+    shutil.copy2(NIFI_SOURCE_FILE, archive_file)
+
+    with archive_file.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as file:
+        expected_records = max(
+            sum(1 for _ in csv.reader(file)) - 1,
+            0,
+        )
+
+    if expected_records == 0:
+        raise ValueError("CSV contains no data records")
+
+    print(
+        f"Archived {archive_file}; "
+        f"expected records: {expected_records}"
+    )
+
+    return {
+        "archive_file": str(archive_file),
+        "expected_records": expected_records,
+    }
+
+
+# =========================================================
+# TASK 3: TRIGGER NIFI
+# =========================================================
+
+def trigger_nifi_ingestion(**context):
+    batch_id = context["ti"].xcom_pull(
+        task_ids="generate_batch_id"
+    )
+
+    token = nifi_token()
+
+    try:
+        if not NIFI_SOURCE_FILE.is_file():
+            raise FileNotFoundError(
+                "NiFi source CSV is missing"
+            )
+
+        update_nifi_batch_id(token, batch_id)
+
+        # Start downstream processors first.
+        for processor_id in DOWNSTREAM_PROCESSORS:
+            set_processor_state(
+                token,
+                processor_id,
+                "RUNNING",
+            )
+
+        # Start GetFile last.
+        set_processor_state(
+            token,
+            GETFILE_ID,
+            "RUNNING",
+        )
+
+        # GetFile polls every 30 seconds.
+        deadline = time.time() + 240
+
+        while time.time() < deadline:
+            if not NIFI_SOURCE_FILE.exists():
+                print("NiFi retrieved customers.csv")
+                break
+
+            time.sleep(5)
+        else:
+            raise TimeoutError(
+                "NiFi did not retrieve the CSV within 240 seconds"
+            )
+
+        # Stop polling for additional files.
+        set_processor_state(
+            token,
+            GETFILE_ID,
+            "STOPPED",
+        )
+
+        print(f"NiFi ingestion started for {batch_id}")
+
+    except Exception:
+        stop_retail_processors(token)
+        raise
+
+
+# =========================================================
+# TASK 4: MONITOR NIFI
+# =========================================================
+
+def monitor_nifi_ingestion(**context):
+    ti = context["ti"]
+    batch_id = ti.xcom_pull(task_ids="generate_batch_id")
+    archive = ti.xcom_pull(task_ids="archive_source_file")
+    expected_records = archive["expected_records"]
+
+    if not batch_id or expected_records is None:
+        raise RuntimeError("Missing batch ID or expected CSV record count")
+
+    token = nifi_token()
+
+    try:
+        response = nifi_request(
+            "GET",
+            "/process-groups/root/connections",
+            token,
+        )
+
+        processor_ids = set(RETAIL_PROCESSORS)
+        connection_ids = []
+
+        for item in response.get("connections", []):
+            component = item.get("component", {})
+            source_processor = component.get("source", {})
+            destination = component.get("destination", {})
+
+            if (
+                source_processor.get("id") in processor_ids
+                and destination.get("id") in processor_ids
+            ):
+                connection_ids.append(component["id"])
+
+        if not connection_ids:
+            raise RuntimeError("No Retail CSV connections found")
+
+        deadline = time.time() + 600
+        empty_checks = 0
+
+        while time.time() < deadline:
+            total_queued = 0
+
+            for connection_id in connection_ids:
+                status = nifi_request(
+                    "GET",
+                    f"/flow/connections/{connection_id}/status",
+                    token,
+                )
+                snapshot = status.get(
+                    "connectionStatus", {}
+                ).get("aggregateSnapshot", {})
+
+                total_queued += int(snapshot.get("queuedCount", 0))
+
+            print(f"NiFi queued FlowFiles: {total_queued}")
+
+            if total_queued == 0:
+                empty_checks += 1
+            else:
+                empty_checks = 0
+
+            if empty_checks >= 3:
+                print("NiFi queues drained; checking PostgreSQL")
+
+                hook = PostgresHook(
+                    postgres_conn_id=POSTGRES_CONN_ID
+                )
+
+                for attempt in range(12):
+                    row = hook.get_first(
+                        """
+                        SELECT COUNT(*)
+                        FROM staging.stg_customers
+                        WHERE batch_id = %s
+                        """,
+                        parameters=(batch_id,),
+                    )
+
+                    actual_records = int(row[0])
+
+                    print(
+                        f"Batch {batch_id}: "
+                        f"{actual_records}/{expected_records} records"
+                    )
+
+                    if actual_records == expected_records:
+                        print("PostgreSQL ingestion verified")
+                        return True
+
+                    if actual_records > expected_records:
+                        raise RuntimeError(
+                            f"Batch {batch_id} has {actual_records} "
+                            f"records; expected {expected_records}"
+                        )
+
+                    time.sleep(5)
+
+                raise RuntimeError(
+                    f"Batch {batch_id} ingestion incomplete: "
+                    f"expected {expected_records}, "
+                    f"found {actual_records}"
+                )
+
+            time.sleep(5)
+
+        raise TimeoutError(
+            "NiFi queues did not drain within 10 minutes"
+        )
+
+    finally:
+        stop_retail_processors(token)
+
+
+# =========================================================
+# TASK 5: VALIDATE STAGING
+# =========================================================
+
+def validate_staging(**context):
+    ti = context["ti"]
+
+    batch_id = ti.xcom_pull(
+        task_ids="generate_batch_id"
+    )
+
+    archive = ti.xcom_pull(
+        task_ids="archive_source_file"
+    )
+
+    expected_records = archive["expected_records"]
+
+    hook = PostgresHook(
+        postgres_conn_id=POSTGRES_CONN_ID
+    )
 
     row = hook.get_first(
         """
@@ -21,26 +472,45 @@ def validate_staging():
         WHERE batch_id = %s
           AND source_system = %s;
         """,
-        parameters=(BATCH_ID, SOURCE_SYSTEM),
+        parameters=(batch_id, SOURCE_SYSTEM),
     )
 
     record_count = row[0]
 
     if record_count == 0:
-        raise ValueError(f"No staging records found for {BATCH_ID}")
+        raise ValueError(
+            f"No staging records found for {batch_id}"
+        )
 
-    print(f"Validated batch {BATCH_ID}: {record_count} records")
+    if record_count != expected_records:
+        raise ValueError(
+            f"Expected {expected_records} records; "
+            f"found {record_count}"
+        )
+
+    print(
+        f"Validated batch {batch_id}: {record_count} records"
+    )
 
     return {
-        "batch_id": BATCH_ID,
+        "batch_id": batch_id,
         "records_read": record_count,
-        "start_time": datetime.now(timezone.utc).isoformat(),
     }
 
 
+# =========================================================
+# TASK 6: EXISTING SCD TYPE 2 LOAD
+# =========================================================
+
 def load_customer_dimension(**context):
-    batch = context["ti"].xcom_pull(task_ids="validate_staging")
-    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+    batch = context["ti"].xcom_pull(
+        task_ids="validate_staging"
+    )
+
+    hook = PostgresHook(
+        postgres_conn_id=POSTGRES_CONN_ID
+    )
+
     conn = hook.get_conn()
 
     try:
@@ -95,6 +565,7 @@ def load_customer_dimension(**context):
                   );
                 """
             )
+
             updated_count = cur.rowcount
 
             cur.execute(
@@ -120,6 +591,7 @@ def load_customer_dimension(**context):
                 ON CONFLICT (customer_id) WHERE is_current DO NOTHING;
                 """
             )
+
             inserted_count = cur.rowcount
 
         conn.commit()
@@ -135,44 +607,76 @@ def load_customer_dimension(**context):
     except Exception:
         conn.rollback()
         raise
+
     finally:
         conn.close()
 
+
+# =========================================================
+# TASK 7: EXISTING AUDIT LOGIC WITH DYNAMIC BATCH ID
+# =========================================================
 
 def audit_etl_run(**context):
     ti = context["ti"]
     dag_run = context["dag_run"]
 
-    batch = ti.xcom_pull(task_ids="validate_staging")
-    results = ti.xcom_pull(task_ids="load_customer_dimension")
+    batch_id = ti.xcom_pull(
+        task_ids="generate_batch_id"
+    )
 
-    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+    batch = ti.xcom_pull(
+        task_ids="validate_staging"
+    )
+
+    results = ti.xcom_pull(
+        task_ids="load_customer_dimension"
+    )
+
+    hook = PostgresHook(
+        postgres_conn_id=POSTGRES_CONN_ID
+    )
 
     failed_tasks = []
 
     if batch is None:
-        failed_tasks.append("validate_staging=failed_or_skipped")
+        failed_tasks.append(
+            "validate_staging=failed_or_skipped"
+        )
 
     if batch is not None and results is None:
-        failed_tasks.append("load_customer_dimension=failed_or_skipped")
+        failed_tasks.append(
+            "load_customer_dimension=failed_or_skipped"
+        )
 
     batch_status = "FAILED" if failed_tasks else "SUCCESS"
-    error_message = "; ".join(failed_tasks) if failed_tasks else None
 
-    records_read = (
-        batch["records_read"] if batch else
-        hook.get_first(
+    error_message = (
+        "; ".join(failed_tasks) if failed_tasks else None
+    )
+
+    records_read = 0
+
+    if batch_id:
+        records_read = hook.get_first(
             """
             SELECT COUNT(*)
             FROM staging.stg_customers
-            WHERE batch_id = %s AND source_system = %s;
+            WHERE batch_id = %s
+              AND source_system = %s;
             """,
-            parameters=(BATCH_ID, SOURCE_SYSTEM),
+            parameters=(batch_id, SOURCE_SYSTEM),
         )[0]
+
+    else:
+        batch_id = f"FAILED_{uuid.uuid4().hex[:12]}"
+
+    records_inserted = (
+        results["records_inserted"] if results else 0
     )
 
-    records_inserted = results["records_inserted"] if results else 0
-    records_updated = results["records_updated"] if results else 0
+    records_updated = (
+        results["records_updated"] if results else 0
+    )
 
     hook.run(
         """
@@ -205,7 +709,7 @@ def audit_etl_run(**context):
             error_message = EXCLUDED.error_message;
         """,
         parameters=(
-            BATCH_ID,
+            batch_id,
             WORKFLOW_NAME,
             SOURCE_SYSTEM,
             dag_run.start_date or datetime.now(timezone.utc),
@@ -219,21 +723,47 @@ def audit_etl_run(**context):
     )
 
     print(
-        f"Audit written: run_id={dag_run.run_id}, "
-        f"status={batch_status}, records_read={records_read}, "
-        f"inserted={records_inserted}, updated={records_updated}, "
-        f"failed_tasks={failed_tasks}"
+        f"Audit written: {dag_run.run_id}, "
+        f"{batch_id}, {batch_status}"
     )
 
 
+# =========================================================
+# DAG DEFINITION
+# =========================================================
+
 with DAG(
     dag_id="retail_customer_etl",
-    description="Retail customer staging, SCD Type 2 load, and audit",
+    description=(
+        "Airflow orchestrated NiFi ingestion, "
+        "PostgreSQL SCD Type 2 load, and audit"
+    ),
     start_date=datetime(2026, 11, 5),
     schedule=None,
     catchup=False,
-    tags=["retail", "postgresql", "etl"],
+    max_active_runs=1,
+    tags=["retail", "postgresql", "nifi", "etl"],
 ) as dag:
+
+    generate_batch = PythonOperator(
+        task_id="generate_batch_id",
+        python_callable=generate_batch_id,
+    )
+
+    archive_file = PythonOperator(
+        task_id="archive_source_file",
+        python_callable=archive_source_task,
+    )
+
+    trigger_nifi = PythonOperator(
+        task_id="trigger_nifi_ingestion",
+        python_callable=trigger_nifi_ingestion,
+    )
+
+    monitor_nifi = PythonOperator(
+        task_id="monitor_nifi_ingestion",
+        python_callable=monitor_nifi_ingestion,
+    )
 
     validate = PythonOperator(
         task_id="validate_staging",
@@ -251,4 +781,12 @@ with DAG(
         trigger_rule=TriggerRule.ALL_DONE,
     )
 
-    validate >> load_dimension >> audit
+    (
+        generate_batch
+        >> archive_file
+        >> trigger_nifi
+        >> monitor_nifi
+        >> validate
+        >> load_dimension
+        >> audit
+    )
