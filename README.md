@@ -2,21 +2,21 @@
 
 ## Project Overview
 
-This project demonstrates the design, deployment, administration, security, and operation of an Amazon RDS for PostgreSQL environment integrated with an end-to-end ETL pipeline.
+This project demonstrates the design, deployment, administration, security, and operation of an Amazon RDS for PostgreSQL environment integrated with a multi-source ETL pipeline.
 
-The solution combines AWS infrastructure, PostgreSQL database administration, Apache NiFi-based data ingestion, SQL transformations, and Apache Airflow workflow orchestration.
+The solution combines AWS infrastructure, PostgreSQL database administration, Apache NiFi data ingestion, SQL transformations, and Apache Airflow workflow orchestration.
 
-Data is being integrated from three source types:
+The project integrates data from three source types:
 
 - CSV files
 - Oracle Database
 - MongoDB
 
-CSV ingestion and the initial Oracle LYRIS CUSTOMERS integration have been implemented using Apache NiFi. Airflow orchestration is implemented for the retail CSV workflow, including staging validation, SCD Type 2 dimension loading, and success/failure audit logging. MongoDB integration is planned.
+CSV ingestion and the initial Oracle LYRIS CUSTOMERS integration have been implemented using Apache NiFi. The retail CSV workflow is orchestrated by Airflow, including source-file archiving, NiFi ingestion triggering and monitoring, staging validation, SCD Type 2 dimension loading, and execution auditing. Oracle LYRIS extraction has been implemented as a NiFi flow; its Airflow orchestration has not yet been confirmed. MongoDB integration remains planned.
 
 The pipeline loads source data into PostgreSQL staging tables, transforms and validates the data, and loads it into production tables.
 
-The project demonstrates practical DBA and data engineering skills, including secure database access, heterogeneous data integration, incremental processing, performance tuning, backup and recovery, and operational automation.
+The project demonstrates practical DBA and data engineering skills, including secure database access, heterogeneous data integration, incremental processing concepts, performance tuning, backup and recovery planning, and operational automation.
 
 ## Technology Stack
 
@@ -24,95 +24,99 @@ The project demonstrates practical DBA and data engineering skills, including se
 |---|---|
 | Cloud Platform | Amazon Web Services (AWS) |
 | Target Database | Amazon RDS for PostgreSQL 18.6 |
-| Source Databases | Oracle Database 19c, MongoDB |
+| Source Databases | Oracle Database 19c, MongoDB (planned) |
 | Source Files | CSV |
 | Infrastructure as Code | Terraform |
 | Data Integration | Apache NiFi 2.12.0 |
 | Workflow Orchestration | Apache Airflow 3.3.2 |
 | Database Language | SQL, PL/pgSQL |
 | Operating System | Red Hat Enterprise Linux 8.10 |
-| Connectivity | JDBC, MongoDB connectivity, TLS/SSL |
+| Connectivity | JDBC, TLS/SSL |
 | Version Control | Git, GitHub |
 
 ## Architecture
 
 The project follows a source-to-staging-to-production architecture.
 
-**Implemented CSV ingestion workflow:**
+### Retail CSV ingestion and orchestration
 
 ```text
-             CSV Source File
-                    |
-                    v
-               Apache NiFi
-                    |
-          +---------+---------+
-          |                   |
-          v                   v
-     CSV Parsing         Batch Metadata
-          |                   |
-          +---------+---------+
-                    |
-                    v
-          PostgreSQL RDS 18.6
-                    |
-                    v
-             STAGING SCHEMA
-                    |
-                    v
-          SQL Transformation
-          Validation and Upsert
-                    |
-                    v
-            PRODUCTION SCHEMA
-                    |
-                    v
-             Customer Data
+CSV Source File
+      |
+      v
+Airflow: retail_customer_etl
+      |
+      +--> Archive source file
+      |
+      +--> Trigger NiFi ingestion
+      |         |
+      |         v
+      |     Apache NiFi
+      |         |
+      |         +--> CSV parsing
+      |         +--> Batch/source metadata
+      |         +--> PostgreSQL insertion
+      |         |
+      |         v
+      |   staging.stg_customers
+      |
+      +--> Monitor NiFi ingestion
+      |
+      +--> Validate staging batch
+      |
+      +--> Load SCD Type 2 dimension
+      |         |
+      |         v
+      |   production.dim_customer
+      |
+      +--> Audit ETL execution
+                |
+                v
+        audit.etl_batch_log
 ```
 
-**Implemented Oracle LYRIS CUSTOMERS workflow:**
+The Airflow DAG coordinates the retail CSV process and uses the configured NiFi and PostgreSQL connections. The DAG is manually triggered (`schedule=None`); scheduled execution is a future enhancement.
+
+### Oracle LYRIS CUSTOMERS ingestion
 
 ```text
-       Oracle Database 19c
-        LYRIS_APP.CUSTOMERS
-                  |
-                  v
-          Apache NiFi 2.12.0
-                  |
-          ExecuteSQL (JDBC)
-                  |
-          UpdateAttribute
-          Batch ID / Source
-                  |
-          UpdateRecord
-          Record Metadata
-                  |
-          PutDatabaseRecord
-                  |
-                  v
-       PostgreSQL RDS 18.6
-                  |
-                  v
-      staging.stg_lyris_customers
-                  |
-          ReplaceText
-          Build Production UPSERT
-                  |
-                  v
-              PutSQL
-                  |
-                  v
-      production.lyris_customers
+Oracle Database 19c
+ LYRIS_APP.CUSTOMERS
+         |
+         v
+ Apache NiFi 2.12.0
+         |
+     ExecuteSQL (JDBC)
+         |
+     UpdateAttribute
+     Batch ID / Source
+         |
+     UpdateRecord
+     Record Metadata
+         |
+     PutDatabaseRecord
+         |
+         v
+ PostgreSQL RDS 18.6
+         |
+ staging.stg_lyris_customers
+         |
+     ReplaceText
+     Build Production UPSERT
+         |
+       PutSQL
+         |
+         v
+ production.lyris_customers
 ```
 
-**Implemented orchestration:**
+The Oracle LYRIS flow has been implemented and manually run through NiFi. Airflow orchestration of this Oracle flow is not yet implemented.
 
-Apache Airflow 3.3.2 runs the `retail_customer_etl` DAG. It validates a batch already loaded in PostgreSQL staging, applies an SCD Type 2 load to `production.dim_customer`, and writes execution results to `audit.etl_batch_log`. The DAG is currently manually triggered (`schedule=None`). The existing NiFi retail processors remain a separate ingestion flow; Airflow does not yet start or stop those processors.
-
-**Planned architecture extensions:**
+### Planned architecture extensions
 
 - MongoDB document and collection extraction.
-- Automated scheduling and a controlled NiFi-to-Airflow handoff.
+- Scheduled Airflow execution.
+- Airflow orchestration for the Oracle LYRIS ingestion flow.
 - Additional production dimension and fact tables.
 
 ## AWS Infrastructure
@@ -129,7 +133,7 @@ Infrastructure includes:
 - Amazon RDS for PostgreSQL 18.6
 - Multi-AZ database deployment
 - EC2 bastion host for administrative access
-- Dedicated EC2 instance for Apache NiFi
+- Dedicated EC2 instance for Apache NiFi and Airflow
 - Encrypted gp3 storage
 
 The RDS database is deployed in private networking and accessed through controlled connections.
@@ -156,44 +160,43 @@ The DBA portion of this project covers:
 
 The database uses separate schemas to organize ingestion, production data, and ETL auditing.
 
-### Staging Layer
+### Staging layer
 
-The staging schema contains source-specific tables used to receive extracted data before production loading.
+Implemented staging tables include:
 
-Implemented tables include:
-
-- `staging.stg_customers` — CSV customer ingestion
+- `staging.stg_customers` — retail CSV customer ingestion
 - `staging.stg_lyris_customers` — Oracle LYRIS customer ingestion
-- Source system identification
-- Batch ID tracking
-- Load timestamps
 
-Oracle source data is maintained separately from the existing CSV customer pipeline.
+The staging data includes source-system identification, batch tracking, and load timestamps.
 
-### Production Data Model
+Oracle source data is maintained separately from the retail CSV customer pipeline.
+
+### Production data model
 
 Implemented production tables include:
 
 - `production.dim_customer` — retail customer dimension with SCD Type 2 history
 - `production.lyris_customers` — Oracle LYRIS customer records
 
-The customer dimension maintains current and historical versions using effective dates and an `is_current` flag. The Oracle production table maintains source-system and batch metadata.
+The retail customer dimension maintains current and historical versions using effective dates and an `is_current` flag. The Oracle production table maintains source-system and batch metadata.
 
-### Audit Schema
+### Audit schema
 
 The audit schema contains:
 
 - `audit.etl_batch_log`
 
-This table supports ETL execution tracking and operational monitoring. The retail Airflow DAG writes batch status, record counts, timestamps, error details, and the Airflow run identifier. PostgreSQL generates the `execution_id` identity value.
+This table supports ETL execution tracking and operational monitoring. Airflow records batch status, record counts, timestamps, error details, and the Airflow run identifier. PostgreSQL generates the `execution_id` identity value.
+
+The current design can contain separate NiFi-side and Airflow-side audit entries for the same batch. Interpret the entries by batch ID and execution source; do not add their counters together as though they represent separate source records.
 
 ## ETL Pipeline
 
-The ETL workflow is organized into three primary stages.
+The ETL workflow is organized into extract, transform, and load stages.
 
 ### 1. Extract
 
-Apache NiFi is used to extract data from source systems and load it into PostgreSQL staging tables.
+Apache NiFi extracts data from source systems and loads it into PostgreSQL staging tables.
 
 **Implemented CSV extraction:**
 
@@ -203,7 +206,7 @@ Apache NiFi is used to extract data from source systems and load it into Postgre
 - `PutDatabaseRecord` processor for PostgreSQL insertion
 - PostgreSQL JDBC connectivity
 - Batch identification and source metadata
-- Staging data validation
+- NiFi success and failure audit routing
 
 **Implemented Oracle extraction:**
 
@@ -255,49 +258,54 @@ The production layer receives data from the staging layer.
 
 **Implemented:**
 
-- CSV customer production table
-- Oracle LYRIS customer production table
+- Retail customer dimension loading
+- Oracle LYRIS customer production loading
 - SQL-based inserts and updates
-- Conflict handling using `ON CONFLICT`
+- Conflict handling using `ON CONFLICT` for the Oracle production load
 - Batch ID tracking
 - Created and updated timestamps
+- SCD Type 2 history management for retail customers
 
 **Planned capabilities:**
 
-- Dimension table loading
-- Fact table loading
-- Incremental processing
-- Change detection
+- Additional dimension and fact table loading
+- Broader incremental processing
 - Rejected-record handling
-- Idempotent ETL execution
-- Data reconciliation
+- Expanded source-to-target reconciliation
 
 ## ETL Monitoring and Automation
 
-The audit schema and Airflow provide execution tracking for the retail CSV workflow.
+Airflow coordinates the retail CSV ingestion and production load. The `retail_customer_etl` DAG contains seven tasks:
 
-**Implemented:**
+1. `generate_batch_id` — creates the batch identifier for the run.
+2. `archive_source_file` — archives the input file before NiFi consumes it.
+3. `trigger_nifi_ingestion` — starts the retail NiFi ingestion flow through the NiFi API.
+4. `monitor_nifi_ingestion` — monitors ingestion and checks that the expected batch has reached staging.
+5. `validate_staging` — validates the batch in `staging.stg_customers`.
+6. `load_customer_dimension` — applies the SCD Type 2 transformation to `production.dim_customer`.
+7. `audit_etl_run` — records the Airflow execution outcome and processing counts in `audit.etl_batch_log`.
 
-- `audit.etl_batch_log` records successful and failed executions
-- Airflow DAG `retail_customer_etl` with three dependent tasks: `validate_staging`, `load_customer_dimension`, and `audit_etl_run`
-- Staging batch validation through the `postgres_operations` Airflow connection
-- SCD Type 2 processing in a database transaction
-- Audit task configured with `TriggerRule.ALL_DONE`, so audit logging runs when upstream tasks fail
-- Airflow run ID stored in `airflow_run_id`, with a partial unique index supporting retry-safe audit upserts
-- Audit fields for records read, inserted, updated, rejected, status, error message, and timestamps
-- Successful pipeline execution verified
-- Failure path tested using a nonexistent batch; the audit row recorded `FAILED`
-- Separate DAGs for staging batch history, audit inspection, and NiFi API connectivity testing
+**Verified execution:**
+
+- The DAG imported successfully without DAG import errors.
+- A manual Airflow run completed with all seven tasks successful.
+- The verified batch loaded four CSV customer records into `staging.stg_customers`.
+- The Airflow audit entry recorded `SUCCESS` and four records read.
+- Prior failed runs remain available in audit history.
+
+The reported inserted and updated counters describe the dimension-load operation; they should not be summed to infer a source-row total. The source/staging count for the verified batch was four records.
 
 **Current scope and limitations:**
 
-- The retail DAG processes a batch already present in staging. It does not yet trigger the NiFi retail processors.
-- The DAG is manually triggered; scheduled execution and a controlled NiFi handoff remain future enhancements.
-- Inserted and updated counts reflect the SCD Type 2 dimension load. Rejected-record classification and source-to-target reconciliation are not yet implemented.
+- The retail DAG is manually triggered (`schedule=None`).
+- Oracle LYRIS extraction is implemented in NiFi, but its Airflow orchestration is not yet confirmed.
+- MongoDB extraction remains planned.
+- NiFi and Airflow may each write an audit entry for the same batch. Use batch ID and execution context to interpret the records.
+- Rejected-record classification and comprehensive source-to-target reconciliation remain future enhancements.
 
 ## Performance and Reliability
 
-The DBA engineering portion will cover:
+The DBA engineering portion includes work and planned exercises in:
 
 - Query execution plan analysis
 - Index design and optimization
@@ -313,13 +321,11 @@ The DBA engineering portion will cover:
 
 ```text
 postgres-rds-etl-pipeline/
-│
 ├── README.md
-├── .gitignore
+├── README_ETL_SQL.md
+├── 1_PostgreSQL_RDS_ETL_Engineering.docx
 ├── customers_sample.csv
-│
 ├── docs/
-│
 ├── etl/
 │   ├── airflow/
 │   │   └── dags/
@@ -327,26 +333,14 @@ postgres-rds-etl-pipeline/
 │   │       ├── staging_batch_history.py
 │   │       ├── inspect_etl_audit.py
 │   │       └── nifi_connection_test.py
-│   │
 │   └── nifi/
 │       └── flows/
 │           ├── csv_customers_ingestion_audit_flow.json
 │           ├── csv_customers_ingestion.json
+│           ├── csv_customers_ingestion_orchestration.json
 │           └── oracle_lyris_customers_ingestion.json
-│
 ├── scripts/
-│
 ├── sql/
-│   ├── audit/
-│   │   └── 01_etl_batch_log.sql
-│   │
-│   ├── production/
-│   │   └── 01_customers.sql
-│   │
-│   └── staging/
-│       ├── 01_stg_customers.sql
-│       └── 02_validate_customer_ingestion.sql
-│
 └── terraform/
 ```
 
@@ -355,19 +349,19 @@ postgres-rds-etl-pipeline/
 | Phase | Description | Status |
 |---|---|---|
 | 1 | AWS infrastructure and RDS deployment | Complete |
-| 2 | PostgreSQL administration and security | Complete |
+| 2 | PostgreSQL administration and security foundation | Complete |
 | 3 | Database and ETL schema design | Complete |
 | 4 | CSV extraction using Apache NiFi | Complete |
-| 5 | NiFi success and failure audit handling | Complete |
-| 6 | Customer staging-to-production upsert | Complete |
-| 7 | Oracle LYRIS CUSTOMERS extraction and production load | Complete |
-| 8 | Airflow orchestration and audit logging for retail CSV batch | Complete (manual trigger; NiFi triggering not integrated yet) |
+| 5 | NiFi success and failure audit handling | Implemented |
+| 6 | Retail customer staging-to-production SCD Type 2 load | Complete |
+| 7 | Oracle LYRIS CUSTOMERS NiFi extraction and production load | Complete |
+| 8 | Airflow orchestration of retail CSV ingestion and load | Implemented and successfully verified |
 | 9 | PostgreSQL performance tuning | Planned |
-| 10 | Backup, recovery, and PITR | Planned |
-| 11 | High availability and operational security | Planned |
+| 10 | Backup, recovery, and PITR exercises | Planned |
+| 11 | High availability and operational security enhancements | In progress / further exercises planned |
 | 12 | Data transformation and cleansing enhancements | Planned |
-| 13 | Production dimension and fact loading | Planned |
-| 14 | Incremental ETL and advanced upserts | Planned |
+| 13 | Additional production dimension and fact loading | Planned |
+| 14 | Expanded incremental ETL and reconciliation | Planned |
 | 15 | MongoDB extraction | Planned |
 | 16 | Final documentation and portfolio review | In progress |
 
@@ -385,13 +379,13 @@ Security is incorporated throughout the architecture.
 - Secure source database credentials
 - No passwords, private keys, or Terraform state files committed to GitHub
 
-Connection details and environment-specific configuration should be supplied separately when importing or deploying the NiFi flow.
+Connection details and environment-specific configuration should be supplied separately when importing or deploying NiFi flow definitions. Review exported flow definitions for sensitive configuration before committing or sharing them.
 
 ## Documentation
 
-Project implementation details, configuration steps, SQL scripts, and operational procedures are maintained in the `docs/` directory.
+Project implementation details, configuration steps, SQL scripts, and operational procedures are maintained in the `docs/` directory and the repository README files.
 
-Documentation includes or will include:
+Documentation covers:
 
 - AWS infrastructure deployment
 - PostgreSQL DBA administration
@@ -400,13 +394,13 @@ Documentation includes or will include:
 - NiFi success and failure auditing
 - SQL transformation and production loading
 - Oracle extraction and NiFi configuration
-- MongoDB extraction
 - Airflow orchestration and DAG operations
 - DBA monitoring SQL and RDS CloudWatch monitoring
 - Backup and recovery procedures
+- MongoDB extraction (planned)
 
 ## Project Objective
 
 The goal of this project is to demonstrate practical PostgreSQL DBA and data engineering capabilities in a cloud-based environment.
 
-It brings together AWS infrastructure, PostgreSQL administration, Oracle and MongoDB integration, Apache NiFi, Apache Airflow, SQL development, dimensional modeling, ETL automation, performance optimization, and recovery planning in one end-to-end engineering project.
+It brings together AWS infrastructure, PostgreSQL administration, Oracle integration, planned MongoDB integration, Apache NiFi, Apache Airflow, SQL development, dimensional modeling, ETL automation, performance optimization, and recovery planning in one engineering project.
