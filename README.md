@@ -12,7 +12,7 @@ The project integrates data from three source types:
 - Oracle Database
 - MongoDB
 
-CSV ingestion and the initial Oracle LYRIS CUSTOMERS integration have been implemented using Apache NiFi. The retail CSV workflow is orchestrated by Airflow, including source-file archiving, NiFi ingestion triggering and monitoring, staging validation, SCD Type 2 dimension loading, and execution auditing. Oracle LYRIS extraction has been implemented as a NiFi flow; its Airflow orchestration has not yet been confirmed. MongoDB integration remains planned.
+CSV ingestion and the initial Oracle LYRIS CUSTOMERS integration have been implemented using Apache NiFi. Airflow orchestrates both pipelines: the retail CSV workflow archives the source file, triggers and monitors NiFi, validates staging, loads the SCD Type 2 customer dimension, and audits execution; the Oracle LYRIS workflow starts and monitors its dedicated NiFi processors, verifies the staging-to-production batch, and audits the Airflow run. The retail DAG is scheduled daily at 2:00 AM Eastern, and the Oracle LYRIS DAG is scheduled daily at 2:15 AM Eastern. The Oracle DAG is deployed and registered without import errors; its first scheduled execution remains pending verification. MongoDB integration remains planned.
 
 The pipeline loads source data into PostgreSQL staging tables, transforms and validates the data, and loads it into production tables.
 
@@ -24,7 +24,7 @@ The project demonstrates practical DBA and data engineering skills, including se
 |---|---|
 | Cloud Platform | Amazon Web Services (AWS) |
 | Target Database | Amazon RDS for PostgreSQL 18.6 |
-| Source Databases | Oracle Database 19c, MongoDB (planned) |
+| Source Databases | Oracle Database 19c |
 | Source Files | CSV |
 | Infrastructure as Code | Terraform |
 | Data Integration | Apache NiFi 2.12.0 |
@@ -75,7 +75,7 @@ Airflow: retail_customer_etl
         audit.etl_batch_log
 ```
 
-The Airflow DAG coordinates the retail CSV process and uses the configured NiFi and PostgreSQL connections. The DAG is manually triggered (`schedule=None`); scheduled execution is a future enhancement.
+The `retail_customer_etl` DAG coordinates the retail CSV process and uses the configured NiFi and PostgreSQL connections. It is scheduled daily at 2:00 AM Eastern (`America/New_York`) and also supports manual triggering.
 
 ### Oracle LYRIS CUSTOMERS ingestion
 
@@ -110,13 +110,11 @@ Oracle Database 19c
  production.lyris_customers
 ```
 
-The Oracle LYRIS flow has been implemented and manually run through NiFi. Airflow orchestration of this Oracle flow is not yet implemented.
+The Oracle LYRIS flow has been implemented and manually run through NiFi. The `oracle_lyris_customer_etl` Airflow DAG is deployed and registered without import errors. It starts the LYRIS downstream processors before the Oracle `ExecuteSQL` processor, monitors LYRIS flow queues, verifies the latest batch in staging and production, and records the Airflow audit entry. It is scheduled daily at 2:15 AM Eastern (`America/New_York`). Its first scheduled execution has not yet been verified.
 
 ### Planned architecture extensions
 
-- MongoDB document and collection extraction.
-- Scheduled Airflow execution.
-- Airflow orchestration for the Oracle LYRIS ingestion flow.
+- First scheduled-run verification for the Oracle LYRIS Airflow DAG.
 - Additional production dimension and fact tables.
 
 ## AWS Infrastructure
@@ -225,7 +223,6 @@ The initial Oracle pipeline successfully extracted and loaded three customer rec
 
 **Planned extraction capabilities:**
 
-- MongoDB collection extraction
 - Incremental extraction from database sources
 - Additional source-specific data type and schema handling
 
@@ -275,7 +272,7 @@ The production layer receives data from the staging layer.
 
 ## ETL Monitoring and Automation
 
-Airflow coordinates the retail CSV ingestion and production load. The `retail_customer_etl` DAG contains seven tasks:
+Airflow coordinates the retail CSV ingestion and production load. The `retail_customer_etl` DAG contains seven tasks and is scheduled daily at 2:00 AM Eastern:
 
 1. `generate_batch_id` — creates the batch identifier for the run.
 2. `archive_source_file` — archives the input file before NiFi consumes it.
@@ -295,10 +292,22 @@ Airflow coordinates the retail CSV ingestion and production load. The `retail_cu
 
 The reported inserted and updated counters describe the dimension-load operation; they should not be summed to infer a source-row total. The source/staging count for the verified batch was four records.
 
+### Oracle LYRIS Airflow orchestration
+
+The `oracle_lyris_customer_etl` DAG is deployed to the Airflow DAG directory, appears in `airflow dags list`, and has no DAG import errors. The only warning observed during the import-error check was the optional Graphviz rendering warning; it does not prevent DAG registration or execution.
+
+The Oracle DAG contains three tasks:
+
+1. `trigger_lyris_nifi_ingestion` — starts the LYRIS downstream processors and then starts the Oracle extraction processor.
+2. `monitor_lyris_ingestion` — monitors the LYRIS NiFi queues and verifies the latest batch in `staging.stg_lyris_customers` and `production.lyris_customers`.
+3. `audit_lyris_run` — writes the Airflow execution result to `audit.etl_batch_log`.
+
+The Oracle LYRIS DAG is scheduled daily at 2:15 AM Eastern. Its first scheduled execution has not yet been verified.
+
 **Current scope and limitations:**
 
-- The retail DAG is manually triggered (`schedule=None`).
-- Oracle LYRIS extraction is implemented in NiFi, but its Airflow orchestration is not yet confirmed.
+- The retail DAG is scheduled daily at 2:00 AM Eastern; a manual run completed successfully with all seven tasks successful.
+- The Oracle LYRIS DAG is deployed, registered, and scheduled for 2:15 AM Eastern; first scheduled-run verification is pending.
 - MongoDB extraction remains planned.
 - NiFi and Airflow may each write an audit entry for the same batch. Use batch ID and execution context to interpret the records.
 - Rejected-record classification and comprehensive source-to-target reconciliation remain future enhancements.
@@ -355,14 +364,14 @@ postgres-rds-etl-pipeline/
 | 5 | NiFi success and failure audit handling | Implemented |
 | 6 | Retail customer staging-to-production SCD Type 2 load | Complete |
 | 7 | Oracle LYRIS CUSTOMERS NiFi extraction and production load | Complete |
-| 8 | Airflow orchestration of retail CSV ingestion and load | Implemented and successfully verified |
-| 9 | PostgreSQL performance tuning | Planned |
-| 10 | Backup, recovery, and PITR exercises | Planned |
-| 11 | High availability and operational security enhancements | In progress / further exercises planned |
-| 12 | Data transformation and cleansing enhancements | Planned |
-| 13 | Additional production dimension and fact loading | Planned |
-| 14 | Expanded incremental ETL and reconciliation | Planned |
-| 15 | MongoDB extraction | Planned |
+| 8 | Airflow orchestration of retail CSV ingestion and load | Implemented, scheduled, and manually verified |
+| 9 | Airflow orchestration of Oracle LYRIS ingestion | Deployed, registered, and scheduled; first scheduled run pending verification |
+| 10 | PostgreSQL performance tuning | Planned |
+| 11 | Backup, recovery, and PITR exercises | Planned |
+| 12 | High availability and operational security enhancements | In progress / further exercises planned |
+| 13 | Data transformation and cleansing enhancements | Planned |
+| 14 | Additional production dimension and fact loading | Planned |
+| 15 | Expanded incremental ETL and reconciliation | Planned |
 | 16 | Final documentation and portfolio review | In progress |
 
 ## Security Considerations
@@ -397,7 +406,7 @@ Documentation covers:
 - Airflow orchestration and DAG operations
 - DBA monitoring SQL and RDS CloudWatch monitoring
 - Backup and recovery procedures
-- MongoDB extraction (planned)
+
 
 ## Project Objective
 

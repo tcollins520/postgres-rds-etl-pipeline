@@ -10,6 +10,7 @@ etl/
 │   └── dags/
 │       ├── inspect_etl_audit.py
 │       ├── nifi_connection_test.py
+│       ├── oracle_lyris_customer_etl.py
 │       ├── retail_customer_etl.py
 │       └── staging_batch_history.py
 ├── nifi/
@@ -41,7 +42,8 @@ Location: `etl/airflow/dags/`
 
 | File | Purpose |
 |---|---|
-| `retail_customer_etl.py` | Main retail customer workflow. Generates a batch ID, archives the source file, triggers and monitors NiFi ingestion, validates the staging batch, loads the customer dimension using SCD Type 2, and audits the run. |
+| `retail_customer_etl.py` | Retail customer workflow. Generates a batch ID, archives the source file, triggers and monitors NiFi ingestion, validates the staging batch, loads the customer dimension using SCD Type 2, and audits the run. |
+| `oracle_lyris_customer_etl.py` | Oracle LYRIS workflow. Starts and monitors only the LYRIS NiFi processors, verifies the staging-to-production batch, and writes an Airflow execution audit record. |
 | `staging_batch_history.py` | DAG for inspecting staging-batch history. |
 | `inspect_etl_audit.py` | DAG for inspecting ETL audit records. |
 | `nifi_connection_test.py` | DAG for testing the configured NiFi connection. |
@@ -58,7 +60,15 @@ The main retail customer DAG has seven tasks:
 
 The DAG uses the Airflow connections `nifi_api` and `postgres_operations`. Connection credentials are managed in Airflow and must not be placed in source files or committed to Git.
 
-The DAG is currently manually triggered (`schedule=None`).
+The retail DAG is scheduled daily at 2:00 AM Eastern (`America/New_York`). It can also be manually triggered when operationally appropriate.
+
+The Oracle LYRIS DAG has three tasks:
+
+1. **Trigger LYRIS NiFi ingestion (`trigger_lyris_nifi_ingestion`)** — starts the LYRIS downstream processors first and starts the Oracle `ExecuteSQL` processor last. It does not start the Retail or PRISM processors.
+2. **Monitor LYRIS ingestion (`monitor_lyris_ingestion`)** — monitors the LYRIS flow queues, then verifies the latest LYRIS batch in `staging.stg_lyris_customers` against `production.lyris_customers`.
+3. **Audit LYRIS run (`audit_lyris_run`)** — writes the Airflow execution result to `audit.etl_batch_log`, including the Airflow run identifier.
+
+The Oracle LYRIS DAG uses the same Airflow connections, `nifi_api` and `postgres_operations`. It is scheduled daily at 2:15 AM Eastern (`America/New_York`). The DAG is registered and has no import errors, but its first scheduled Airflow execution has not yet been verified.
 
 ### Apache NiFi flow definitions
 
@@ -71,9 +81,9 @@ Location: `etl/nifi/flows/`
 | `csv_customers_ingestion_orchestration.json` | Current exported NiFi CSV ingestion flow definition associated with the retail Airflow-orchestrated workflow. |
 | `oracle_lyris_customers_ingestion.json` | NiFi flow definition for the Oracle LYRIS customer ingestion path. |
 
-These JSON files are NiFi flow definitions, not Airflow DAGs. Airflow orchestration logic is maintained separately in `etl/airflow/dags/retail_customer_etl.py`. Review processor configuration, controller-service references, parameter contexts, and environment-specific settings before importing or starting a flow in another NiFi environment.
+These JSON files are NiFi flow definitions, not Airflow DAGs. Airflow orchestration logic is maintained separately in `etl/airflow/dags/retail_customer_etl.py` and `etl/airflow/dags/oracle_lyris_customer_etl.py`. Review processor configuration, controller-service references, parameter contexts, and environment-specific settings before importing or starting a flow in another NiFi environment.
 
-The Oracle LYRIS NiFi flow has been implemented and manually run. Its orchestration by Airflow is not yet confirmed.
+The Oracle LYRIS NiFi flow has been implemented and manually run. Its Airflow DAG is now deployed, registered, and scheduled; the first scheduled execution remains pending verification.
 
 ### Scripts
 
@@ -121,7 +131,7 @@ The SCD Type 2 transformation preserves historical customer versions. When a cus
 
 ## 4. End-to-end processing flow
 
-The current retail CSV workflow is orchestrated by Airflow:
+The retail CSV workflow is orchestrated by Airflow:
 
 ```text
 CSV source file
@@ -160,9 +170,9 @@ Airflow: audit_etl_run
 audit.etl_batch_log
 ```
 
-The DAG is manually triggered (`schedule=None`). It coordinates the retail NiFi ingestion, staging validation, production dimension load, and Airflow audit.
+The retail DAG runs daily at 2:00 AM Eastern and coordinates NiFi ingestion, staging validation, the production dimension load, and Airflow auditing.
 
-The Oracle LYRIS extraction is a separate NiFi flow. Its Airflow orchestration is not yet confirmed.
+The Oracle LYRIS extraction is a separate NiFi flow orchestrated by `oracle_lyris_customer_etl`. That DAG runs daily at 2:15 AM Eastern, starts only the LYRIS processors, monitors the flow, verifies the batch in staging and production, and records the Airflow execution audit. Its first scheduled execution has not yet been verified.
 
 ## 5. Running and operating the workflow
 
@@ -170,15 +180,16 @@ Before triggering a run:
 
 1. Confirm the expected CSV input file is present in the configured NiFi incoming location.
 2. Confirm the Airflow connections `nifi_api` and `postgres_operations` are configured and available.
-3. Confirm the NiFi flow and its required controller services are configured for the target environment.
-4. Trigger `retail_customer_etl` from the Airflow UI or using the project's approved Airflow operating procedure.
+3. Confirm the relevant NiFi flow and its required controller services are configured for the target environment.
+4. For the retail pipeline, confirm the input file and allow the daily 2:00 AM Eastern schedule to run, or trigger `retail_customer_etl` manually.
+5. For Oracle LYRIS, confirm Oracle connectivity and the LYRIS NiFi processors are available; the daily Airflow schedule is 2:15 AM Eastern.
 
 After the run:
 
-1. Review all seven task states in the Airflow UI.
+1. Review the task states for the applicable DAG in the Airflow UI.
 2. Review the corresponding Airflow execution record in `audit.etl_batch_log`.
-3. Review the batch in `staging.stg_customers`.
-4. Confirm the expected current and historical customer versions in `production.dim_customer`.
+3. For retail CSV, review the batch in `staging.stg_customers` and confirm current and historical customer versions in `production.dim_customer`.
+4. For Oracle LYRIS, review the batch in `staging.stg_lyris_customers` and confirm the corresponding rows in `production.lyris_customers`.
 5. Investigate failed ingestion, validation, load, or audit details before rerunning a batch.
 
 The DAG archives the source file before triggering NiFi ingestion. Do not manually move, restore, or reprocess an input file without first checking the batch's staging and production state. This helps avoid duplicate or unintended ingestion.
@@ -200,6 +211,8 @@ Implemented and exercised:
 - CSV customer ingestion through NiFi.
 - NiFi success and failure audit routing.
 - Airflow source-file archiving and NiFi API triggering/monitoring for the retail CSV workflow.
+- Daily Airflow scheduling for the retail CSV workflow at 2:00 AM Eastern.
+- Oracle LYRIS Airflow DAG deployment and registration, scheduled daily at 2:15 AM Eastern; first scheduled run pending.
 - Airflow staging validation and customer SCD Type 2 loading.
 - Airflow success/failure audit handling.
 - Oracle LYRIS extraction and production loading through a separate NiFi flow.

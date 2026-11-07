@@ -5,6 +5,8 @@ import ssl
 import time
 import uuid
 
+import pendulum
+
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -393,46 +395,33 @@ def monitor_nifi_ingestion(**context):
                 empty_checks = 0
 
             if empty_checks >= 3:
-                print("NiFi queues drained; checking PostgreSQL")
-
                 hook = PostgresHook(
                     postgres_conn_id=POSTGRES_CONN_ID
                 )
 
-                for attempt in range(12):
-                    row = hook.get_first(
-                        """
-                        SELECT COUNT(*)
-                        FROM staging.stg_customers
-                        WHERE batch_id = %s
-                        """,
-                        parameters=(batch_id,),
-                    )
+                actual_records = hook.get_first(
+                    """
+                    SELECT COUNT(*)
+                    FROM staging.stg_customers
+                    WHERE batch_id = %s
+                      AND source_system = %s;
+                    """,
+                    parameters=(batch_id, SOURCE_SYSTEM),
+                )[0]
 
-                    actual_records = int(row[0])
-
+                if actual_records == expected_records:
                     print(
-                        f"Batch {batch_id}: "
-                        f"{actual_records}/{expected_records} records"
+                        f"NiFi ingestion complete: "
+                        f"{actual_records} records"
                     )
+                    return
 
-                    if actual_records == expected_records:
-                        print("PostgreSQL ingestion verified")
-                        return True
-
-                    if actual_records > expected_records:
-                        raise RuntimeError(
-                            f"Batch {batch_id} has {actual_records} "
-                            f"records; expected {expected_records}"
-                        )
-
-                    time.sleep(5)
-
-                raise RuntimeError(
-                    f"Batch {batch_id} ingestion incomplete: "
-                    f"expected {expected_records}, "
-                    f"found {actual_records}"
-                )
+                if actual_records > expected_records:
+                    raise ValueError(
+                        f"Unexpected staging count: "
+                        f"expected {expected_records}, "
+                        f"found {actual_records}"
+                    )
 
             time.sleep(5)
 
@@ -738,8 +727,8 @@ with DAG(
         "Airflow orchestrated NiFi ingestion, "
         "PostgreSQL SCD Type 2 load, and audit"
     ),
-    start_date=datetime(2026, 11, 5),
-    schedule=None,
+    start_date=pendulum.datetime(2026, 11, 5, tz="America/New_York"),
+    schedule="0 2 * * *",
     catchup=False,
     max_active_runs=1,
     tags=["retail", "postgresql", "nifi", "etl"],
